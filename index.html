@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>CHALAPATHI ERP v10.8</title>
+<title>CHALAPATHI ERP v10.9 — Safety Upgrade</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Syne:wght@700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
@@ -944,6 +944,14 @@ body.theme-light .ov-item{background:rgba(240,244,248,.8)}
       <div class="form-group"><label class="form-label">Security Answer</label><input type="text" id="cpAnswer" placeholder="Answer"/></div>
       <button class="btn-sm btn-primary" onclick="changeAdminPassword()">💾 Update Password</button>
     </div>
+    <!-- System Health & Data Safety -->
+    <div class="card" id="systemHealthCard">
+      <div class="card-header"><div class="card-title"><div class="card-title-icon">🩺</div>System Health &amp; Data Safety</div></div>
+      <p style="color:var(--text2);font-size:12px;margin-bottom:10px">Run a quick check of browser storage, app modules, and backup readiness.</p>
+      <button class="btn-sm btn-primary" type="button" onclick="runSystemDiagnostics()">🧪 Run System Check</button>
+      <div id="systemDiagnosticsResult" aria-live="polite" style="margin-top:12px;font-size:12px;line-height:1.7;color:var(--text2)">Not checked yet.</div>
+      <div style="margin-top:10px;padding:10px;border-radius:10px;background:rgba(245,158,11,.09);border:1px solid rgba(245,158,11,.25);font-size:11.5px;line-height:1.6;color:var(--text2)"><b style="color:var(--yellow)">Important:</b> This version stores records on this browser/device. A password screen in a standalone HTML file is not server-side security, and records do not automatically synchronize to other phones. True cloud sync and secure multi-user access require a configured backend/database.</div>
+    </div>
     <!-- Excel Backup (offline snapshot) -->
     <div class="card">
       <div class="card-header"><div class="card-title"><div class="card-title-icon">📊</div>Excel Backup</div></div>
@@ -1316,6 +1324,11 @@ function loadTheme(){ try{ return localStorage.getItem('erp_theme')||''; }catch(
 // Keep pendingIn in localStorage (transient punch state)
 function savePending(){ try{ localStorage.setItem('erp_pending', JSON.stringify(data.pendingIn)); }catch(e){} }
 function loadPending(){ try{ const s=localStorage.getItem('erp_pending'); return s?JSON.parse(s):{}; }catch(e){ return {}; } }
+// Actual punch timestamps are kept privately for the Excel RawPunchTimes sheet only.
+// All visible web pages and calculations continue to use rounded fields on each work log.
+function loadRawPunchMap(){ try{ const s=localStorage.getItem('ch_raw_punch_times'); return s?JSON.parse(s):{}; }catch(e){ return {}; } }
+function saveRawPunchMap(map){ try{ localStorage.setItem('ch_raw_punch_times', JSON.stringify(map)); }catch(e){} }
+
 
 function showLoader(msg='Loading…'){
   let el=document.getElementById('sbLoader');
@@ -1345,6 +1358,13 @@ async function initData(){
     data.transactions = transactions.map(mapTX);
     data.deletedLogs = deletedLogs.map(mapWL);
     data.deletedTx = deletedTx.map(mapTX);
+    // Normalize existing records too, so every web page, calculation, and export uses rounded values.
+    for(const l of data.workLogs){
+      if(normalizeStoredPunchLog(l)) await sbUpdate('work_logs', l.id, wlToDb(l));
+    }
+    for(const l of data.deletedLogs){
+      if(normalizeStoredPunchLog(l)) await sbUpdate('deleted_logs', l.id, {...wlToDb(l), deleted_at:l.deletedAt||null});
+    }
     // Settings
     const bs = settings.find(s=>s.key==='baseSalary');
     const or = settings.find(s=>s.key==='otRate');
@@ -1386,7 +1406,7 @@ function mapTX(r){
 }
 function wlToDb(l){
   return {
-    id: l.id, staff_id: l.staffId, staff_name: l.staffName,
+    id: l.id, staff_id: l.staffId, staff_name: l.staffName, deleted_at: l.deletedAt||null,
     in_date: l.inDate, in_time: l.inTime,
     out_date: l.outDate, out_time: l.outTime,
     work_hrs: l.workHrs, ot_hrs: l.otHrs,
@@ -1497,10 +1517,83 @@ function buildXlsx(sheets){
 }
 
 // ══════════ EXCEL BACKUP (offline snapshot shown in Admin panel) ══════════
+// Official punch rounding used by the web app, calculations, and all exports.
+// IN: minutes 0-5 stay at the half-hour mark; minutes 6-29 go forward.
+// OUT: always round down to the previous half-hour mark.
+function roundPunchDate(dateObj, type){
+  const d = new Date(dateObj.getTime());
+  const mins = d.getMinutes();
+  const withinSlot = mins % 30;
+  if(type === 'IN'){
+    if(withinSlot > 5) d.setMinutes(mins + (30 - withinSlot), 0, 0);
+    else d.setMinutes(mins - withinSlot, 0, 0);
+  } else {
+    d.setMinutes(mins - withinSlot, 0, 0);
+  }
+  return d;
+}
+// Day-duty overtime has a 30-minute deduction; night-duty overtime has no deduction.
+function calculateOvertimeHours(workHours, isNight){
+  const deduction = isNight ? 0 : 0.5;
+  return +Math.max(0, Number(workHours || 0) - 8 - deduction).toFixed(2);
+}
+
+function normalizeStoredPunchLog(log){
+  let changed=false;
+  if(log.inDate && log.inTime){
+    const rawIn=new Date(log.inDate+'T'+log.inTime+':00');
+    if(!Number.isNaN(rawIn.getTime())){
+      const roundedIn=roundPunchDate(rawIn,'IN');
+      const nd=toDateStr(roundedIn), nt=toTimeStr(roundedIn);
+      if(log.inDate!==nd || log.inTime!==nt){ log.inDate=nd; log.inTime=nt; changed=true; }
+    }
+  }
+  if(log.outDate && log.outTime && log.inDate && log.inTime){
+    const rawOut=new Date(log.outDate+'T'+log.outTime+':00');
+    if(!Number.isNaN(rawOut.getTime())){
+      const roundedOut=roundPunchDate(rawOut,'OUT');
+      const od=toDateStr(roundedOut), ot=toTimeStr(roundedOut);
+      if(log.outDate!==od || log.outTime!==ot){ log.outDate=od; log.outTime=ot; changed=true; }
+      const inTs=new Date(log.inDate+'T'+log.inTime+':00').getTime();
+      const outTs=roundedOut.getTime();
+      const hours=Math.max(0,(outTs-inTs)/3600000);
+      const workHrs=+hours.toFixed(2);
+      const night=log.inDate!==log.outDate;
+      const otHrs=calculateOvertimeHours(workHrs, night);
+      if(log.workHrs!==workHrs){log.workHrs=workHrs;changed=true;}
+      if(log.otHrs!==otHrs){log.otHrs=otHrs;changed=true;}
+      if(!!log.isNight!==night){log.isNight=night;changed=true;}
+    }
+  }
+  return changed;
+}
+
+function roundedExcelPunch(dateStr, timeStr, type){
+  if(!dateStr || !timeStr) return {date:dateStr||'',time:timeStr||''};
+  const parts=String(timeStr).split(':').map(Number);
+  const d=new Date(String(dateStr)+'T00:00:00');
+  if(Number.isNaN(d.getTime()) || parts.length<2 || parts.some(Number.isNaN)) return {date:dateStr,time:timeStr};
+  d.setHours(parts[0],parts[1],parts[2]||0,0);
+  const mins=d.getMinutes();
+  if(type==='IN'){
+    const withinSlot=mins%30;
+    if(withinSlot>5) d.setMinutes(mins+(30-withinSlot));
+    else d.setMinutes(mins-withinSlot);
+  } else {
+    d.setMinutes(mins-(mins%30));
+  }
+  const y=d.getFullYear(), m=String(d.getMonth()+1).padStart(2,'0'), day=String(d.getDate()).padStart(2,'0');
+  return {date:`${y}-${m}-${day}`,time:d.toTimeString().slice(0,5)};
+}
 function buildBackupSheets(){
   const staffRows=[['Staff ID','Name'], ...data.staff.map(s=>[s.id,s.name])];
-  const wlRows=[['ID','Staff ID','Staff Name','In Date','In Time','Out Date','Out Time','Work Hrs','OT Hrs','Night','Apshan'],
+  const wlRows=[['ID','Staff ID','Staff Name','In Date','Rounded In Time','Out Date','Rounded Out Time','Work Hrs','OT Hrs','Night','Apshan'],
     ...data.workLogs.map(l=>[l.id,l.staffId,l.staffName,l.inDate,l.inTime,l.outDate||'',l.outTime||'',l.workHrs,l.otHrs,l.isNight?'Yes':'No',l.apshan||0])];
+  const roundedPunchRows=[['ID','Staff ID','Staff Name','In Date','Rounded In Time','Out Date','Rounded Out Time'],
+    ...data.workLogs.map(l=>[l.id,l.staffId,l.staffName,l.inDate,l.inTime,l.outDate||'',l.outTime||''])];
+  const rawPunchMap=loadRawPunchMap();
+  const rawPunchRows=[['ID','Staff ID','Staff Name','Actual In Date','Actual In Time','Actual Out Date','Actual Out Time','Raw Data Status'],
+    ...data.workLogs.map(l=>{const r=rawPunchMap[String(l.id)];return [l.id,l.staffId,l.staffName,r?.inDate||l.inDate,r?.inTime||l.inTime,r?.outDate||l.outDate||'',r?.outTime||l.outTime||'',r?'Captured actual punch':'Historical raw time unavailable; rounded value shown'];})];
   const txRows=[['ID','Staff ID','Month','Type','Description','Amount','Apshan'],
     ...data.transactions.map(t=>[t.id,t.staffId,t.month,t.type,t.desc,t.amt,t.apshan||0])];
   const delWlRows=[['ID','Staff ID','Staff Name','In Date','Out Date','Deleted At'],
@@ -1509,7 +1602,7 @@ function buildBackupSheets(){
     ...data.deletedTx.map(t=>[t.id,t.staffId,t.month,t.type,t.desc,t.amt,t.deletedAt||''])];
   const settingsRows=[['Key','Value'],['baseSalary',data.baseSalary],['otRate',data.otRate],['Generated At', new Date().toLocaleString('en-IN')]];
   return [
-    {name:'Staff', rows:staffRows}, {name:'WorkLogs', rows:wlRows}, {name:'Transactions', rows:txRows},
+    {name:'Staff', rows:staffRows}, {name:'WorkLogs', rows:wlRows}, {name:'RoundedPunchTimes', rows:roundedPunchRows}, {name:'RawPunchTimes', rows:rawPunchRows}, {name:'Transactions', rows:txRows},
     {name:'DeletedLogs', rows:delWlRows}, {name:'DeletedTx', rows:delTxRows}, {name:'Settings', rows:settingsRows}
   ];
 }
@@ -1735,23 +1828,29 @@ function closeModal(){ document.getElementById('confirmModal').classList.remove(
 
 async function doPunch(){
   const type=pType, staffId=pStaff; closeModal();
-  const now=new Date(), dateStr=toDateStr(now), timeStr=toTimeStr(now);
+  const actualNow=new Date();
+  const roundedNow=roundPunchDate(actualNow,type);
+  const dateStr=toDateStr(roundedNow), timeStr=toTimeStr(roundedNow);
   const staff=data.staff.find(s=>s.id===staffId);
   if(!staff){ showToast('Staff not found','error'); return; }
   if(!data.pendingIn) data.pendingIn={};
   if(type==='IN'){
     if(data.pendingIn[staffId]){ showToast('Already Punched IN — punch OUT first','error'); return; }
-    data.pendingIn[staffId]={date:dateStr,time:timeStr,ts:now.getTime()};
+    data.pendingIn[staffId]={date:dateStr,time:timeStr,ts:roundedNow.getTime(),rawDate:toDateStr(actualNow),rawTime:toTimeStr(actualNow)};
     savePending();
     showToast('✅ '+staff.name+' Punched IN at '+timeStr,'success');
   } else {
     const inRec=data.pendingIn[staffId];
     if(!inRec){ showToast('No active Punch IN for this staff','error'); return; }
-    const diffMs=now.getTime()-new Date(inRec.ts).getTime();
+    const roundedInTs = (inRec.date && inRec.time) ? new Date(inRec.date+'T'+inRec.time+':00').getTime() : Number(inRec.ts);
+    const diffMs=roundedNow.getTime()-roundedInTs;
     const diffHrs=diffMs/3600000;
-    const otHrs=Math.max(0,diffHrs-8);
     const isNight=inRec.date!==dateStr;
+    const otHrs=calculateOvertimeHours(diffHrs, isNight);
     const newLog={id:Date.now(),staffId,staffName:staff.name,inDate:inRec.date,inTime:inRec.time,outDate:dateStr,outTime:timeStr,workHrs:+diffHrs.toFixed(2),otHrs:+otHrs.toFixed(2),isNight,apshan:0};
+    const rawPunchMap=loadRawPunchMap();
+    rawPunchMap[String(newLog.id)]={inDate:inRec.rawDate||inRec.date,inTime:inRec.rawTime||inRec.time,outDate:toDateStr(actualNow),outTime:toTimeStr(actualNow)};
+    saveRawPunchMap(rawPunchMap);
     try{
       showLoader('Saving punch…');
       await sbInsert('work_logs', wlToDb(newLog));
@@ -2317,9 +2416,14 @@ async function saveEditModal(){
       const outTime=document.getElementById('ef_outTime').value;
       const apshan=parseFloat(document.getElementById('ef_apshan').value)||0;
       if(inDate&&inTime&&outDate&&outTime){
-        const diff=(new Date(outDate+'T'+outTime)-new Date(inDate+'T'+inTime))/3600000;
-        l.inDate=inDate;l.inTime=inTime;l.outDate=outDate;l.outTime=outTime;l.apshan=apshan;
-        l.workHrs=+diff.toFixed(2);l.otHrs=+Math.max(0,diff-8).toFixed(2);l.isNight=inDate!==outDate;
+        // Admin edits must follow the same rounded-time rules as normal punches.
+        const roundedIn=roundPunchDate(new Date(inDate+'T'+inTime+':00'),'IN');
+        const roundedOut=roundPunchDate(new Date(outDate+'T'+outTime+':00'),'OUT');
+        const finalInDate=toDateStr(roundedIn), finalInTime=toTimeStr(roundedIn);
+        const finalOutDate=toDateStr(roundedOut), finalOutTime=toTimeStr(roundedOut);
+        const diff=Math.max(0,(roundedOut.getTime()-roundedIn.getTime())/3600000);
+        l.inDate=finalInDate;l.inTime=finalInTime;l.outDate=finalOutDate;l.outTime=finalOutTime;l.apshan=apshan;
+        l.workHrs=+diff.toFixed(2);l.isNight=finalInDate!==finalOutDate;l.otHrs=calculateOvertimeHours(l.workHrs,l.isNight);
         await sbUpdate('work_logs', l.id, wlToDb(l));
       }
       renderMasterWorkLog(); renderWorkLog(); renderSalary(); renderExpenses(); if(document.getElementById('page-calendar').classList.contains('active')) renderCalendar();
@@ -2518,70 +2622,129 @@ async function deleteStaffConfirmed(id){
   }catch(e){ hideLoader(); showToast('❌ '+e.message,'error'); }
 }
 
-// ══════════ DATA EXPORT / IMPORT ══════════
+// ══════════ COMPLETE DATA EXPORT / IMPORT ══════════
+const ERP_BACKUP_VERSION=2;
+const ERP_LOCAL_KEYS=[
+  'erp_theme','erp_pending','ch_raw_punch_times',
+  'user_taskflow_data_v4','user_taskflow_settings_v1','user_taskflow_last_export_v1',
+  'chalapathi_ai_reminders_v1','chalapathi_ai_chat_v2'
+];
+function getLocalAppSnapshot(){
+  const out={};
+  for(const key of ERP_LOCAL_KEYS){ try{ const v=localStorage.getItem(key); if(v!==null) out[key]=v; }catch(e){} }
+  // Also preserve known app-owned preferences that use the ERP prefix.
+  try{ for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); if(k && (k.startsWith('chalapathi_erp_fallback_')||k.startsWith('ch_'))) { const v=localStorage.getItem(k); if(v!==null) out[k]=v; } } }catch(e){}
+  return out;
+}
 function exportData(){
-  const exportObj={
-    staff:data.staff, workLogs:data.workLogs, transactions:data.transactions,
-    deletedLogs:data.deletedLogs, deletedTx:data.deletedTx,
-    baseSalary:data.baseSalary, otRate:data.otRate
-  };
-  const blob=new Blob([JSON.stringify(exportObj,null,2)],{type:'application/json'});
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(blob);
-  a.download='chalapathi_erp_backup_'+new Date().toISOString().slice(0,10)+'.json';
-  a.click();
-  showToast('✅ Backup exported','success');
+  try{
+    const exportObj={
+      app:'CHALAPATHI ERP', backupVersion:ERP_BACKUP_VERSION, exportedAt:new Date().toISOString(),
+      storageMode:'local-device',
+      staff:data.staff||[], workLogs:data.workLogs||[], transactions:data.transactions||[],
+      deletedLogs:data.deletedLogs||[], deletedTx:data.deletedTx||[],
+      baseSalary:data.baseSalary, otRate:data.otRate,
+      localStorage:getLocalAppSnapshot()
+    };
+    const blob=new Blob([JSON.stringify(exportObj,null,2)],{type:'application/json;charset=utf-8'});
+    triggerDownload(blob,'chalapathi_erp_complete_backup_'+new Date().toISOString().slice(0,10)+'.json');
+    showToast('✅ Complete ERP + Task Manager JSON backup downloaded','success');
+  }catch(e){ console.error('Backup export failed',e); showToast('❌ Backup failed: '+e.message,'error'); }
 }
 async function importData(e){
-  const file=e.target.files[0]; if(!file) return;
-  const reader=new FileReader();
-  reader.onload=ev=>{
-    try{
-      const imported=JSON.parse(ev.target.result);
-      if(!imported.staff) throw new Error('Invalid backup');
-      appConfirm('This will REPLACE all current data. Continue?', ()=>importDataConfirmed(imported));
-    }catch(err){ showToast('❌ '+err.message,'error'); }
-  };
-  reader.readAsText(file);
-  e.target.value='';
+  const file=e.target.files && e.target.files[0]; if(!file) return;
+  try{
+    const text=await file.text();
+    const imported=JSON.parse(text);
+    if(!imported || !Array.isArray(imported.staff) || !Array.isArray(imported.workLogs) || !Array.isArray(imported.transactions)) throw new Error('This is not a valid CHALAPATHI ERP JSON backup.');
+    appConfirm('This will REPLACE the current ERP records and restore app preferences/tasks included in the backup. Download a backup of current data first. Continue?', ()=>importDataConfirmed(imported));
+  }catch(err){ showToast('❌ '+err.message,'error'); }
+  finally{ e.target.value=''; }
 }
 async function importDataConfirmed(imported){
   try{
-    showLoader('Importing data…');
-    // Clear all tables first
-    for(const s of data.staff) await sbDeleteByKey('staff','id',s.id).catch(()=>{});
-    for(const l of data.workLogs) await sbDelete('work_logs',l.id).catch(()=>{});
-    for(const t of data.transactions) await sbDelete('transactions',t.id).catch(()=>{});
-    // Insert imported data
-    for(const s of imported.staff) await sbInsert('staff',s).catch(()=>{});
-    for(const l of imported.workLogs) await sbInsert('work_logs',wlToDb(l)).catch(()=>{});
-    for(const t of imported.transactions) await sbInsert('transactions',txToDb(t)).catch(()=>{});
-    if(imported.baseSalary) await sbUpsert('settings',{key:'baseSalary',value:String(imported.baseSalary)},'key').catch(()=>{});
-    if(imported.otRate) await sbUpsert('settings',{key:'otRate',value:String(imported.otRate)},'key').catch(()=>{});
-    // Reload
-    await initData(); populateSelects(); renderAdminStaff();
-    hideLoader(); showToast('✅ Backup imported successfully','success');
-  }catch(err){ hideLoader(); showToast('❌ '+err.message,'error'); }
+    // Safety net: create a fresh JSON snapshot of the currently loaded records before destructive restore.
+    // Keep a manual backup too; browser download settings may block automatic downloads.
+    try{ exportData(); }catch(backupErr){ console.warn('Pre-restore safety backup could not be triggered',backupErr); }
+    showLoader('Restoring complete backup…');
+    // Clear the known tables, including deleted records and settings.
+    const tableNames=['staff','work_logs','transactions','deleted_logs','deleted_tx','settings'];
+    for(const table of tableNames){
+      const rows=await sbGet(table);
+      const keyPath=IDB_STORES[table]||'id';
+      for(const row of rows) await sbDelete(table,row[keyPath]);
+    }
+    for(const row of (imported.staff||[])) await sbInsert('staff',{id:row.id,name:row.name});
+    for(const row of (imported.workLogs||[])) await sbInsert('work_logs',wlToDb(row));
+    for(const row of (imported.transactions||[])) await sbInsert('transactions',txToDb(row));
+    for(const row of (imported.deletedLogs||[])) await sbInsert('deleted_logs',{...wlToDb(row),deleted_at:row.deletedAt||null});
+    for(const row of (imported.deletedTx||[])) await sbInsert('deleted_tx',{...txToDb(row),deleted_at:row.deletedAt||null});
+    const settingsToSave=[
+      {key:'baseSalary',value:String(imported.baseSalary==null?15000:imported.baseSalary)},
+      {key:'otRate',value:String(imported.otRate==null?100:imported.otRate)}
+    ];
+    for(const setting of settingsToSave) await sbInsert('settings',setting);
+    if(imported.localStorage && typeof imported.localStorage==='object'){
+      for(const [key,value] of Object.entries(imported.localStorage)){
+        if(typeof value==='string' && (ERP_LOCAL_KEYS.includes(key)||key.startsWith('chalapathi_erp_fallback_')||key.startsWith('ch_'))){
+          try{localStorage.setItem(key,value);}catch(err){console.warn('Could not restore local setting',key,err);}
+        }
+      }
+    }
+    await initData(); populateSelects(); updatePunchStatus(); renderTodayPunches();
+    renderWorkLog(); renderCalendar(); await renderSalary(); renderExpenses(); renderDeletedPage(); renderAdminStaff(); renderBackupInfo();
+    if(window.tmReloadAfterRestore) window.tmReloadAfterRestore();
+    hideLoader(); showToast('✅ Complete backup restored. Check attendance, salary, and tasks.','success');
+  }catch(err){ hideLoader(); console.error('Backup import failed',err); showToast('❌ Restore failed: '+err.message,'error'); }
 }
 function clearAllData(){
-  appConfirm('⚠️ This will delete ALL data permanently. Are you sure?', ()=>{
+  appConfirm('⚠️ This will delete ALL ERP data permanently. Export a backup first. Continue?', ()=>{
     appConfirm('Last chance — this cannot be undone!', clearAllDataConfirmed);
   });
 }
 async function clearAllDataConfirmed(){
   showLoader('Clearing all data…');
   try{
-    for(const s of data.staff) await sbDeleteByKey('staff','id',s.id).catch(()=>{});
-    for(const l of data.workLogs) await sbDelete('work_logs',l.id).catch(()=>{});
-    for(const t of data.transactions) await sbDelete('transactions',t.id).catch(()=>{});
-    for(const l of data.deletedLogs) await sbDelete('deleted_logs',l.id).catch(()=>{});
-    for(const t of data.deletedTx) await sbDelete('deleted_tx',t.id).catch(()=>{});
-    await sbDeleteByKey('settings','key','baseSalary').catch(()=>{});
-    await sbDeleteByKey('settings','key','otRate').catch(()=>{});
-    localStorage.removeItem('erp_pending');
-    await initData(); populateSelects(); renderAdminStaff();
-    hideLoader(); showToast('✅ All data cleared','success');
+    for(const table of ['staff','work_logs','transactions','deleted_logs','deleted_tx','settings']){
+      const rows=await sbGet(table); const keyPath=IDB_STORES[table]||'id';
+      for(const row of rows) await sbDelete(table,row[keyPath]);
+    }
+    for(const key of ERP_LOCAL_KEYS){ try{localStorage.removeItem(key);}catch(e){} }
+    await initData(); populateSelects(); renderAdminStaff(); renderBackupInfo();
+    hideLoader(); showToast('✅ ERP records cleared','success');
   }catch(e){ hideLoader(); showToast('❌ '+e.message,'error'); }
+}
+
+// Basic, honest runtime diagnostics. This does not replace end-to-end browser testing.
+async function runSystemDiagnostics(){
+  const el=document.getElementById('systemDiagnosticsResult'); if(!el) return;
+  el.textContent='Running checks…';
+  const results=[];
+  let idbStatus='Unavailable';
+  try{
+    if('indexedDB' in window){
+      const db=await idbOpen();
+      const required=Object.keys(IDB_STORES);
+      const missing=required.filter(name=>!db.objectStoreNames.contains(name));
+      idbStatus=missing.length?'Open, missing stores: '+missing.join(', '):'Available; all '+required.length+' stores present';
+      db.close(); _idb=null;
+    }
+  }catch(e){ idbStatus='Unavailable ('+(e&&e.name?e.name:'open failed')+'); local fallback may be used'; }
+  results.push(['Database storage',idbStatus]);
+  results.push(['Local storage',(()=>{try{const k='ch_diag_test';localStorage.setItem(k,'1');localStorage.removeItem(k);return 'Writable';}catch(e){return 'Blocked';}})()]);
+  results.push(['Attendance records',Array.isArray(data.workLogs)?String(data.workLogs.length)+' records loaded':'Not loaded']);
+  results.push(['Staff records',Array.isArray(data.staff)?String(data.staff.length)+' staff loaded':'Not loaded']);
+  results.push(['Transactions',Array.isArray(data.transactions)?String(data.transactions.length)+' records loaded':'Not loaded']);
+  results.push(['Task Manager',(()=>{try{const a=JSON.parse(localStorage.getItem('user_taskflow_data_v4')||'[]');return Array.isArray(a)?String(a.length)+' tasks stored':'Data format needs checking';}catch(e){return 'Data could not be read';}})()]);
+  const requiredFns=['roundPunchDate','calculateOvertimeHours','exportData','importData','runSystemDiagnostics'];
+  const missingFns=requiredFns.filter(name=>typeof window[name]!=='function');
+  results.push(['Core helper functions',missingFns.length?'Missing: '+missingFns.join(', '):'Present']);
+  results.push(['Network status',navigator.onLine?'Browser reports online (not proof of cloud sync)':'Offline']);
+  results.push(['Cloud sync','Not configured in this standalone HTML']);
+  results.push(['Admin security','Local UI password only; server-side protection not available offline']);
+  results.push(['Backup reminder','Download JSON and Excel backups regularly; keep a copy outside this device']);
+  const esc=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  el.innerHTML=results.map(([label,value])=>'<div style="display:flex;gap:8px;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--border);padding:6px 0"><b style="color:var(--text);flex:0 0 42%">'+esc(label)+'</b><span style="text-align:right;overflow-wrap:anywhere">'+esc(value)+'</span></div>').join('')+'<div style="margin-top:10px;padding:9px;border-radius:8px;background:rgba(245,158,11,.09);border:1px solid rgba(245,158,11,.25)">Diagnostic complete. This is a quick storage/module check, not a full browser test. Cloud sync and server-side security are still not configured in this standalone file.</div>';
 }
 
 // ══════════ HELPERS ══════════
